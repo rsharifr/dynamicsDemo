@@ -17,8 +17,8 @@
 //  F<speed>   – spin Forward  at <speed> steps/sec  e.g. F800
 //  R<speed>   – spin Reverse  at <speed> steps/sec  e.g. R400
 //  S          – Stop
-//  E          – Enable driver  (pulls ENA LOW)
-//  D          – Disable driver (pulls ENA HIGH)
+//  E          – Enable both drivers (pulls ENA LOW)
+//  D          – Disable both drivers (pulls ENA HIGH)
 //  ?          – Print current status
 //
 //  Speed range: 1 – 20000 steps/sec (adjust MAX_SPEED as needed)
@@ -75,11 +75,10 @@
 //  M<mm>   – Move actuator by <mm> millimeters, e.g. M50 or M-20
 //            (positive = "forward" direction, negative = reverse)
 //  P       – Print current tracked actuator position (mm)
-//  Z       – Zero the position counter at the CURRENT location
-//            (there's no homing/limit switch yet, so this is how
-//            you manually tell the firmware "this spot = 0mm".
-//            Do this once after power-up, at a known reference
-//            point, same idea as homing a 3D printer but manual.)
+//  Z<mm>   – Set the actuator position to <mm> millimeters, e.g. Z50
+//            This changes the physical-position reference without
+//            changing the raw step count/encoder reading. It is an
+//            absolute position setpoint, not a step reset.
 //
 //  IMPORTANT — CALIBRATE MM_PER_STEP BEFORE TRUSTING DISTANCES:
 //  The actuator is belt-driven and MM_PER_STEP below is a PLACEHOLDER.
@@ -292,7 +291,7 @@ void setup() {
 
   digitalWrite(PIN_STEP, LOW);
   digitalWrite(PIN_DIR,  HIGH);
-  digitalWrite(PIN_ENA,  LOW);   // Enable driver by default
+  digitalWrite(PIN_ENA,  HIGH);   // Disabled at startup; enable with E
 
   pinMode(ACT_PIN_STEP,  OUTPUT);
   pinMode(ACT_PIN_DIR,   OUTPUT);
@@ -300,7 +299,7 @@ void setup() {
 
   digitalWrite(ACT_PIN_STEP,  LOW);
   digitalWrite(ACT_PIN_DIR,   HIGH);
-  digitalWrite(ACT_PIN_ENA,   LOW);   // active LOW — enables DM542T by default
+  digitalWrite(ACT_PIN_ENA,   HIGH);   // Disabled at startup; enable with E
 
   Serial.begin(115200);
   // Wait up to 2 seconds for a Serial Monitor connection.
@@ -623,10 +622,13 @@ void handleCommand(String cmd) {
       break;
     }
 
-    case 'S':   // Stop (ramps down to 0 instead of cutting instantly)
+    case 'S':   // Stop but keep drivers engaged
       targetSpeed = 0;
       stopping    = true;
-      Serial.println("■ Stopping (ramping down)");
+
+      actTargetSpeed = 0;
+      actStopping    = true;
+      Serial.println("■ Stopping both motors (ramping down, drivers remain enabled)");
       break;
 
     case '?':   // Status
@@ -685,41 +687,78 @@ void handleCommand(String cmd) {
       Serial.println(" steps from last zero point)");
       break;
 
-    case 'Z':   // Zero the actuator's position counter at current location
-      actPositionSteps = 0;
-      Serial.println("✓ Actuator position zeroed at current location");
+    case 'Z': { // Set actuator position (mm) to an absolute value.
+      String valueText = cmd.substring(1);
+      valueText.trim();
+      if (valueText.length() == 0) {
+        Serial.println("! Z requires a numeric millimeter value, e.g. Z50 or Z-10");
+        break;
+      }
+
+      float targetMm = valueText.toFloat();
+      if (isnan(targetMm) || isinf(targetMm)) {
+        Serial.println("! Invalid Z value — use a number in millimeters, e.g. Z50");
+        break;
+      }
+
+      // Convert desired physical position in mm to the raw step count
+      // that the rest of the code uses internally.
+      long newStepCount = (long)round(targetMm / MM_PER_STEP);
+      actPositionSteps = newStepCount;
+
+      Serial.print("✓ Actuator position set to ");
+      Serial.print(targetMm, 2);
+      Serial.print(" mm (raw steps = ");
+      Serial.print(actPositionSteps);
+      Serial.println(")");
       break;
+    }
 
     case 'E':
-      if (cmd == "E2") {
-        digitalWrite(ACT_PIN_ENA, LOW);   // active LOW enables DM542T
-        Serial.println("✓ Actuator driver enabled");
-      } else {
-        digitalWrite(PIN_ENA, LOW);
-        Serial.println("✓ Spin motor driver enabled");
-      }
+      // Re-enable both drivers, but forcibly zero any motion.
+      motorRunning  = false;
+      stopping      = false;
+      currentSpeed  = 0;
+      targetSpeed   = 0;
+      applySpeedToTimer();
+
+      actMoving      = false;
+      actStopping    = false;
+      actCurrentSpeed = 0;
+      actTargetSpeed  = 0;
+      actStepsRemaining = 0;
+      applySpeedToActuatorTimer();
+
+      digitalWrite(PIN_STEP, LOW);
+      digitalWrite(PIN_ENA, LOW);
+      digitalWrite(ACT_PIN_STEP, LOW);
+      digitalWrite(ACT_PIN_ENA, LOW);
+      Serial.println("✓ Both drivers enabled; motion set to zero");
       break;
 
     case 'D':
-      if (cmd == "D2") {
-        actMoving       = false;
-        actStopping     = false;
-        actCurrentSpeed = 0;
-        actTargetSpeed  = 0;
-        applySpeedToActuatorTimer();
-        digitalWrite(ACT_PIN_ENA, HIGH);  // HIGH disables DM542T
-        Serial.println("○ Actuator driver disabled (motor free)");
-      } else {
-        motorRunning  = false;
-        stopping      = false;
-        currentSpeed  = 0;
-        targetSpeed   = 0;
-        applySpeedToTimer();
-        digitalWrite(PIN_STEP, LOW);
-        digitalWrite(PIN_ENA, HIGH);
-        Serial.println("○ Spin motor driver disabled (motor free)");
-      }
+      // Disable both drivers and stop all motion.
+      motorRunning  = false;
+      stopping      = false;
+      currentSpeed  = 0;
+      targetSpeed   = 0;
+      applySpeedToTimer();
+
+      actMoving      = false;
+      actStopping    = false;
+      actCurrentSpeed = 0;
+      actTargetSpeed  = 0;
+      actStepsRemaining = 0;
+      applySpeedToActuatorTimer();
+
+      digitalWrite(PIN_STEP, LOW);
+      digitalWrite(PIN_ENA, HIGH);
+      digitalWrite(ACT_PIN_STEP, LOW);
+      digitalWrite(ACT_PIN_ENA, HIGH);
+      Serial.println("○ All drivers disabled (both motors free to turn by hand)");
       break;
+
+    default:
       Serial.print("? Unknown command: ");
       Serial.println(cmd);
       printHelp();
@@ -752,17 +791,15 @@ void printHelp() {
   Serial.println("════ Stepper Control (Serial + BLE) ════");
   Serial.println("  F<n>  Forward  n steps/sec  (e.g. F800)");
   Serial.println("  R<n>  Reverse  n steps/sec  (e.g. R400)");
-  Serial.println("  S     Stop");
-  Serial.println("  E     Enable spin motor driver");
-  Serial.println("  D     Disable spin motor driver");
-  Serial.println("  E2    Enable actuator driver");
-  Serial.println("  D2    Disable actuator driver");
+  Serial.println("  S     Stop both motors, drivers stay enabled");
+  Serial.println("  E     Enable both drivers and zero motion");
+  Serial.println("  D     Disable both drivers (free by hand)");
   Serial.println("  ?     Print status");
   Serial.println("  Range: 1 – 20000 steps/sec");
   Serial.println("  ── Actuator ──");
   Serial.println("  M<mm> Move actuator by mm, e.g. M50 or M-20");
   Serial.println("  P     Print actuator position");
-  Serial.println("  Z     Zero actuator position at current spot");
+  Serial.println("  Z<mm> Set actuator position to <mm> (e.g. Z50 or Z-10)");
   Serial.println("  Same commands work via BLE \"Motor Command\" characteristic");
   Serial.println("  IMU streams on BLE \"Gyro Data\" characteristic (~10Hz)");
   Serial.println("  Format: gx,gy,gz,ax,ay,az (deg/s and g-force)");

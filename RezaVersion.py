@@ -380,7 +380,7 @@ def build_gui():
 
     cmd_entry.bind("<Return>", do_send)
 
-    ref = "F<n> Forward  |  R<n> Reverse  |  S Stop  |  M<mm> Actuator  |  Z Zero  |  P Position"
+    ref = "F<n> Forward  |  R<n> Reverse  |  S Stop  |  D Disable  |  E Enable  |  M<mm> Actuator  |  Z<mm> Set Position  |  P Position"
     tk.Label(cmd_frame, text=ref, bg="#1e1e1e", fg="#555555",
              font=("Courier", 8)).pack(side=tk.LEFT, padx=(12, 0))
 
