@@ -76,8 +76,7 @@ def on_gyro_notify(sender, data: bytearray):
         acc3  = vals[5]
         # Gyro magnitude — always positive, represents angular speed
         magnitude = math.sqrt(gyro1**2 + gyro2**2 + gyro3**2)
-        # Apply direction sign from 7th value (1 = forward, -1 = reverse)
-        direction = float(vals[6]) if len(vals) >= 7 else 1.0
+        direction = np.sign(gyro2)
         omega_rads = magnitude * direction
         r_m        = latest_r
         v_ms       = omega_rads * r_m
@@ -89,8 +88,8 @@ def on_gyro_notify(sender, data: bytearray):
             a1_buf      = np.roll(a1_buf,      -1);  a1_buf[-1]      = acc1
             a2_buf      = np.roll(a2_buf,      -1);  a2_buf[-1]      = acc2
             a3_buf      = np.roll(a3_buf,      -1);  a3_buf[-1]      = acc3
-            ar_buf = a1_buf
-            at_buf = -a3_buf
+            ar_buf =  a1_buf
+            at_buf =  a3_buf
             az_buf = -a2_buf
     except Exception as e:
         print(f"Gyro parse error: {e}")

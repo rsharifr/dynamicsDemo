@@ -75,10 +75,10 @@
 //  M<mm>   – Move actuator by <mm> millimeters, e.g. M50 or M-20
 //            (positive = "forward" direction, negative = reverse)
 //  P       – Print current tracked actuator position (mm)
-//  Z<mm>   – Set the actuator position to <mm> millimeters, e.g. Z50
-//            This changes the physical-position reference without
-//            changing the raw step count/encoder reading. It is an
-//            absolute position setpoint, not a step reset.
+//  Z<mm>   – Recalibrate: tell the firmware the actuator is currently
+//            physically at <mm> millimeters, e.g. Z50. Sets ZERO_POS_MM
+//            so that reference is correct, and resets the raw step
+//            count back to zero (new reference frame going forward).
 //
 //  IMPORTANT — CALIBRATE MM_PER_STEP BEFORE TRUSTING DISTANCES:
 //  The actuator is belt-driven and MM_PER_STEP below is a PLACEHOLDER.
@@ -174,7 +174,12 @@ const float   START_SPEED = 80.0;
 // MM_PER_STEP = (200.0 / 215.0) * 0.2 = 0.18605
 // Min radius: 35mm, Max radius: 235mm, Total travel: 200mm
 float MM_PER_STEP   = 0.18605;
-const float MIN_RADIUS_MM = 35.0;   // physical minimum radius at zero position
+
+// Physical position (mm) that corresponds to actPositionSteps == 0.
+// Set to the known physical minimum on first run; recalibrated at
+// runtime by the Z<mm> command (which also resets actPositionSteps
+// to 0), so it stays accurate after a manual position correction.
+float ZERO_POS_MM = 0.35;
 
 const float   ACT_MAX_SPEED_STEPS = 4000;   // steps/sec upper limit for actuator
 const float   ACT_ACCEL_STEPS_PER_SEC2 = 400.0;   // gentler ramp for small motor
@@ -469,7 +474,7 @@ void updateGyro() {
     gyroDataChar.writeValue(buf);
     char posBuf[32];
     snprintf(posBuf, sizeof(posBuf), "%.2f",
-             MIN_RADIUS_MM + (float)actPositionSteps * MM_PER_STEP);
+             ZERO_POS_MM + (float)actPositionSteps * MM_PER_STEP);
     positionChar.writeValue(posBuf);
   }
 }
@@ -551,7 +556,7 @@ void updateActuatorRamp() {
     actStopping       = false;
     applySpeedToActuatorTimer();   // stop the timer cleanly
     Serial.print("✓ Actuator move complete. Position: ");
-    Serial.print(actPositionSteps * MM_PER_STEP, 2);
+    Serial.print(ZERO_POS_MM + actPositionSteps * MM_PER_STEP, 2);
     Serial.println(" mm");
   }
 
@@ -681,13 +686,14 @@ void handleCommand(String cmd) {
 
     case 'P':   // Print current actuator position
       Serial.print("Actuator position: ");
-      Serial.print(actPositionSteps * MM_PER_STEP, 2);
+      Serial.print(ZERO_POS_MM + actPositionSteps * MM_PER_STEP, 2);
       Serial.print(" mm  (");
       Serial.print(actPositionSteps);
       Serial.println(" steps from last zero point)");
       break;
 
-    case 'Z': { // Set actuator position (mm) to an absolute value.
+    case 'Z': { // Recalibrate: tell the firmware the actuator is
+                // physically at <mm> right now.
       String valueText = cmd.substring(1);
       valueText.trim();
       if (valueText.length() == 0) {
@@ -701,16 +707,16 @@ void handleCommand(String cmd) {
         break;
       }
 
-      // Convert desired physical position in mm to the raw step count
-      // that the rest of the code uses internally.
-      long newStepCount = (long)round(targetMm / MM_PER_STEP);
-      actPositionSteps = newStepCount;
+      // The measured physical position becomes the new zero-position
+      // reference, and the step count resets to 0 to match it.
+      ZERO_POS_MM = targetMm;
+      actPositionSteps = 0;
 
       Serial.print("✓ Actuator position set to ");
       Serial.print(targetMm, 2);
-      Serial.print(" mm (raw steps = ");
-      Serial.print(actPositionSteps);
-      Serial.println(")");
+      Serial.print(" mm (ZERO_POS_MM = ");
+      Serial.print(ZERO_POS_MM, 2);
+      Serial.println(", raw steps reset to 0)");
       break;
     }
 
@@ -779,7 +785,7 @@ void printStatus() {
   Serial.println("  ── Actuator ──");
   Serial.print("  Moving    : ");
   Serial.println(actMoving ? (actStopping ? "STOPPING (ramping down)" : "MOVING") : "IDLE");
-  Serial.print("  Position  : "); Serial.print(actPositionSteps * MM_PER_STEP, 2); Serial.println(" mm");
+  Serial.print("  Position  : "); Serial.print(ZERO_POS_MM + actPositionSteps * MM_PER_STEP, 2); Serial.println(" mm");
   Serial.print("  Steps left: "); Serial.println(actStepsRemaining);
   Serial.print("  Act Driver: ");
   Serial.println(digitalRead(ACT_PIN_ENA) == LOW ? "Enabled" : "Disabled");
@@ -799,7 +805,7 @@ void printHelp() {
   Serial.println("  ── Actuator ──");
   Serial.println("  M<mm> Move actuator by mm, e.g. M50 or M-20");
   Serial.println("  P     Print actuator position");
-  Serial.println("  Z<mm> Set actuator position to <mm> (e.g. Z50 or Z-10)");
+  Serial.println("  Z<mm> Recalibrate: tell firmware actuator is at <mm> (e.g. Z50 or Z-10)");
   Serial.println("  Same commands work via BLE \"Motor Command\" characteristic");
   Serial.println("  IMU streams on BLE \"Gyro Data\" characteristic (~10Hz)");
   Serial.println("  Format: gx,gy,gz,ax,ay,az (deg/s and g-force)");
