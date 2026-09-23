@@ -179,7 +179,7 @@ float MM_PER_STEP   = 0.18605;
 // Set to the known physical minimum on first run; recalibrated at
 // runtime by the Z<mm> command (which also resets actPositionSteps
 // to 0), so it stays accurate after a manual position correction.
-float ZERO_POS_MM = 0.35;
+float ZERO_POS_MM = 35.0;
 
 const float   ACT_MAX_SPEED_STEPS = 4000;   // steps/sec upper limit for actuator
 const float   ACT_ACCEL_STEPS_PER_SEC2 = 400.0;   // gentler ramp for small motor

@@ -19,6 +19,7 @@ import asyncio
 import threading
 import math
 import queue
+import time
 import numpy as np
 import tkinter as tk
 import matplotlib
@@ -44,6 +45,8 @@ OMEGA_AXIS     = 1       # Y axis from gyro CSV
 # ── Shared state ──────────────────────────────────────────────
 omega_buf   = np.zeros(BUFFER_SIZE)
 r_buf       = np.zeros(BUFFER_SIZE)
+rdot_buf    = np.zeros(BUFFER_SIZE)
+rddot_buf   = np.zeros(BUFFER_SIZE)
 v_buf       = np.zeros(BUFFER_SIZE)
 a1_buf      = np.zeros(BUFFER_SIZE)
 a2_buf      = np.zeros(BUFFER_SIZE)
@@ -60,9 +63,85 @@ connected  = False
 status_msg = "Scanning for StepperBLE..."
 cmd_queue  = queue.Queue()
 
+# ── Radial Kalman filter ─────────────────────────────────────
+# The position characteristic gives a coarse, quantized r reading; the
+# accelerometer's radial axis gives a noisy but fast-responding r̈ via
+# a_r = r̈ - r·ω². Fusing both (constant-acceleration process model,
+# updated by both measurements every tick) gives smoother, more
+# physically consistent r/ṙ/r̈ than differentiating raw r with
+# np.gradient — especially for ṙ/r̈, where differencing noise blows up.
+class RadialKalmanFilter:
+    # accel_std raised (and pos_std/jerk_std lowered) so the filter leans
+    # on the position sensor for r/ṙ and only lets the accelerometer
+    # nudge r̈, rather than the other way around.
+    def __init__(self, r0, pos_std=0.002, accel_std=.50, jerk_std=0.5):
+        self.x = np.array([r0, 0.0, 0.0])              # [r, rdot, rddot]
+        self.P = np.diag([pos_std**2, 1.0, 4.0])
+        self.pos_var   = pos_std ** 2                   # position sensor noise (m^2)
+        self.accel_var = accel_std ** 2                 # accelerometer noise (m^2/s^4)
+        self.jerk_std  = jerk_std                       # process noise: unmodeled jerk (m/s^3)
+
+    def _process_noise(self, dt):
+        # Discrete white-noise-jerk model: noise enters as jerk and is
+        # integrated through r̈, ṙ, r (standard constant-acceleration Q).
+        q = self.jerk_std ** 2
+        dt2, dt3, dt4, dt5 = dt**2, dt**3, dt**4, dt**5
+        return q * np.array([
+            [dt5 / 20, dt4 / 8,  dt3 / 6],
+            [dt4 / 8,  dt3 / 3,  dt2 / 2],
+            [dt3 / 6,  dt2 / 2,  dt     ],
+        ])
+
+    def predict(self, dt):
+        if dt <= 0:
+            return
+        F = np.array([
+            [1.0, dt, 0.5 * dt * dt],
+            [0.0, 1.0, dt],
+            [0.0, 0.0, 1.0],
+        ])
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + self._process_noise(dt)
+
+    def _update(self, z, H, var):
+        y = z - H @ self.x
+        S = H @ self.P @ H + var
+        K = (self.P @ H) / S
+        self.x = self.x + K * y
+        self.P = (np.eye(3) - np.outer(K, H)) @ self.P
+
+    def update_position(self, r_meas):
+        self._update(r_meas, np.array([1.0, 0.0, 0.0]), self.pos_var)
+
+    def update_radial_accel(self, ar_meas, omega):
+        # Solve a_r = r̈ - r·ω² for r̈, using the filter's current r
+        # estimate for the centripetal term — a pseudo-measurement of r̈.
+        # That r estimate is never exact, and the linearization error
+        # scales with ω² (∂(r·ω²)/∂r = ω²): any residual r uncertainty
+        # gets amplified by ω² and would otherwise leak straight into
+        # r̈, showing up as a spurious r̈ whenever the rig spins even if
+        # r itself is stationary. Fold that propagated uncertainty
+        # (ω⁴ · Var(r)) into this update's effective measurement noise
+        # so the filter automatically trusts the accelerometer less as
+        # spin rate increases, instead of a fixed noise floor that
+        # ignores it.
+        z = ar_meas + self.x[0] * omega ** 2
+        effective_var = self.accel_var + (omega ** 4) * self.P[0, 0]
+        self._update(z, np.array([0.0, 0.0, 1.0]), effective_var)
+
+    @property
+    def r(self):     return self.x[0]
+    @property
+    def rdot(self):  return self.x[1]
+    @property
+    def rddot(self): return self.x[2]
+
+radial_kf    = None
+kf_last_time = None
+
 # ── BLE callbacks ─────────────────────────────────────────────
 def on_gyro_notify(sender, data: bytearray):
-    global latest_r
+    global latest_r, radial_kf, kf_last_time
     try:
         vals = [float(x) for x in data.decode("utf-8").strip().split(",")]
         if len(vals) < 6:
@@ -78,12 +157,30 @@ def on_gyro_notify(sender, data: bytearray):
         magnitude = math.sqrt(gyro1**2 + gyro2**2 + gyro3**2)
         direction = np.sign(gyro2)
         omega_rads = magnitude * direction
-        r_m        = latest_r
-        v_ms       = omega_rads * r_m
+        r_meas     = latest_r
+
+        # Fuse the position reading and radial accelerometer axis (acc1)
+        # into estimates of r, ṙ, r̈ — see RadialKalmanFilter above.
+        now = time.monotonic()
+        if radial_kf is None:
+            radial_kf    = RadialKalmanFilter(r_meas)
+            kf_last_time = now
+        else:
+            radial_kf.predict(now - kf_last_time)
+            kf_last_time = now
+            radial_kf.update_position(r_meas)
+            radial_kf.update_radial_accel(acc1, omega_rads)
+
+        r_m     = radial_kf.r
+        rdot_m  = radial_kf.rdot
+        rddot_m = radial_kf.rddot
+        v_ms    = omega_rads * r_m
         with buf_lock:
-            global omega_buf, r_buf, v_buf, a1_buf, a2_buf, a3_buf, ar_buf, at_buf, az_buf
+            global omega_buf, r_buf, rdot_buf, rddot_buf, v_buf, a1_buf, a2_buf, a3_buf, ar_buf, at_buf, az_buf
             omega_buf   = np.roll(omega_buf,   -1);  omega_buf[-1]   = omega_rads
             r_buf       = np.roll(r_buf,       -1);  r_buf[-1]       = r_m
+            rdot_buf    = np.roll(rdot_buf,    -1);  rdot_buf[-1]    = rdot_m
+            rddot_buf   = np.roll(rddot_buf,   -1);  rddot_buf[-1]   = rddot_m
             v_buf       = np.roll(v_buf,       -1);  v_buf[-1]       = v_ms
             a1_buf      = np.roll(a1_buf,      -1);  a1_buf[-1]      = acc1
             a2_buf      = np.roll(a2_buf,      -1);  a2_buf[-1]      = acc2
@@ -106,6 +203,8 @@ def compute_plot_data():
     """Derive all display quantities from the raw sensor buffers.
 
     r/theta are the polar coordinates, *dot/*ddot their time derivatives.
+    r/rdot/rddot come from RadialKalmanFilter (fusing the position sensor
+    with the radial accelerometer axis), not from differentiating raw r.
     ar/at/az are the raw (measured) accelerometer axes in the polar frame;
     centripetal/coriolis/r_thetaddot/*_total are the corresponding kinematic
     terms computed from r, theta and their derivatives, for comparison
@@ -113,13 +212,13 @@ def compute_plot_data():
     """
     with buf_lock:
         r     = r_buf.copy()
+        rdot  = rdot_buf.copy()
+        rddot = rddot_buf.copy()
         omega = omega_buf.copy()
         ar    = ar_buf.copy()
         at    = at_buf.copy()
         az    = az_buf.copy()
 
-    rdot      = np.gradient(r, DT)
-    rddot     = np.gradient(rdot, DT)
     thetadot  = omega
     thetaddot = np.gradient(omega, DT)
 
@@ -283,7 +382,7 @@ def build_gui():
                  dict(data_key="ar",           label="data",                                   color=RED),
                  dict(data_key="rddot",        label="r_ddot",                                 color=BLUE),
                  dict(data_key="centripetal",  label="centripetal",                             color=GREEN),
-                 dict(data_key="radial_total", label="calculated total",    color=GOLD),
+                 # dict(data_key="radial_total", label="calculated total",    color=GOLD),
              ]),
         dict(key="at",         title="Transverse Acceleration  a_θ  (m/s²)",
              ylabel="a_θ (m/s²)",   unit="m/s²",  fmt=".2f", ylim=(-10, 10),
@@ -291,7 +390,7 @@ def build_gui():
                  dict(data_key="at",               label="data",                                       color=RED),
                  dict(data_key="coriolis",         label="coriolis",                                   color=BLUE),
                  dict(data_key="r_thetaddot",      label="r*theta_ddot",                                color=GREEN),
-                 dict(data_key="transverse_total", label="calculated total",    color=GOLD),
+                 # dict(data_key="transverse_total", label="calculated total",    color=GOLD),
              ]),
         dict(key="az",         title="Vertical Acceleration  a_z  (m/s²)",
              ylabel="a_z (m/s²)",   unit="m/s²",  fmt=".2f", ylim=(-10, 10),
