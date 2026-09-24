@@ -36,11 +36,10 @@ POSITION_UUID  = "19b10003-e8f2-537e-4f6c-d104768a1214"
 MOTOR_CMD_UUID = "19b10001-e8f2-537e-4f6c-d104768a1214"
 
 # ── Settings ──────────────────────────────────────────────────
-WINDOW_SECONDS = 15
-SAMPLE_RATE_HZ = 10
+WINDOW_SECONDS = 10
+SAMPLE_RATE_HZ = 25  # must match GYRO_SEND_INTERVAL_MS on the Arduino
 BUFFER_SIZE    = WINDOW_SECONDS * SAMPLE_RATE_HZ
 DT             = 1.0 / SAMPLE_RATE_HZ
-OMEGA_AXIS     = 1       # Y axis from gyro CSV
 
 # ── Shared state ──────────────────────────────────────────────
 omega_buf   = np.zeros(BUFFER_SIZE)
@@ -74,7 +73,7 @@ class RadialKalmanFilter:
     # accel_std raised (and pos_std/jerk_std lowered) so the filter leans
     # on the position sensor for r/ṙ and only lets the accelerometer
     # nudge r̈, rather than the other way around.
-    def __init__(self, r0, pos_std=0.002, accel_std=.50, jerk_std=0.5):
+    def __init__(self, r0, pos_std=0.005, accel_std=.50, jerk_std=1.9):
         self.x = np.array([r0, 0.0, 0.0])              # [r, rdot, rddot]
         self.P = np.diag([pos_std**2, 1.0, 4.0])
         self.pos_var   = pos_std ** 2                   # position sensor noise (m^2)
@@ -85,6 +84,7 @@ class RadialKalmanFilter:
         # Discrete white-noise-jerk model: noise enters as jerk and is
         # integrated through r̈, ṙ, r (standard constant-acceleration Q).
         q = self.jerk_std ** 2
+        print(dt)
         dt2, dt3, dt4, dt5 = dt**2, dt**3, dt**4, dt**5
         return q * np.array([
             [dt5 / 20, dt4 / 8,  dt3 / 6],
@@ -153,10 +153,16 @@ def on_gyro_notify(sender, data: bytearray):
         acc1  = vals[3]
         acc2  = vals[4]
         acc3  = vals[5]
+        # 7th field (if present): hardware-timed dt in ms since the
+        # Arduino sent the previous sample (measured with micros(), the
+        # nRF52's hardware cycle counter) — see updateGyro() on the
+        # Arduino side. Preferred over a Python-side wall-clock diff,
+        # which is skewed by BLE/OS scheduling jitter on arrival.
+        dt_hw_seconds = vals[6] / 1000.0 if len(vals) >= 7 else None
         # Gyro magnitude — always positive, represents angular speed
-        magnitude = math.sqrt(gyro1**2 + gyro2**2 + gyro3**2)
-        direction = np.sign(gyro2)
-        omega_rads = magnitude * direction
+        omega_magnitude = math.sqrt(gyro1**2 + gyro2**2 + gyro3**2)
+        omega_direction = np.sign(gyro2)
+        omega_rads = omega_magnitude * omega_direction
         r_meas     = latest_r
 
         # Fuse the position reading and radial accelerometer axis (acc1)
@@ -166,7 +172,8 @@ def on_gyro_notify(sender, data: bytearray):
             radial_kf    = RadialKalmanFilter(r_meas)
             kf_last_time = now
         else:
-            radial_kf.predict(now - kf_last_time)
+            dt = dt_hw_seconds if dt_hw_seconds is not None else (now - kf_last_time)
+            radial_kf.predict(dt)
             kf_last_time = now
             radial_kf.update_position(r_meas)
             radial_kf.update_radial_accel(acc1, omega_rads)
@@ -357,7 +364,7 @@ def build_gui():
 
     panel_specs = [
         dict(key="r",          title="Radius  r  (m)",
-             ylabel="r (m)",        unit="m",     fmt=".3f", ylim=(0.055, 0.260),
+             ylabel="r (m)",        unit="m",     fmt=".3f", ylim=(0.03, 0.260),
              series=[dict(data_key="r", label="r", color=BLUE)]),
         dict(key="rdot",       title="Radial Velocity  ṙ  (m/s)",
              ylabel="ṙ (m/s)",     unit="m/s",   fmt=".3f", ylim=(-1, 1),

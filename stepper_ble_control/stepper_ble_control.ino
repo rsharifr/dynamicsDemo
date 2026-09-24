@@ -122,21 +122,29 @@ BLEStringCharacteristic motorCommandChar(
   "19b10001-e8f2-537e-4f6c-d104768a1214",
   BLEWrite | BLEWriteWithoutResponse, 32);
 
-// Gyro + accel data: board notifies subscribers with "gx,gy,gz,ax,ay,az"
-// gyro in deg/sec, accel in g-force
+// Gyro + accel data: board notifies subscribers with "gx,gy,gz,ax,ay,az,dt_ms"
+// gyro in deg/sec, accel in g-force, dt_ms = hardware-timed interval (ms)
+// since the previous sample was sent.
 BLEStringCharacteristic gyroDataChar(
   "19b10002-e8f2-537e-4f6c-d104768a1214",
-  BLERead | BLENotify, 96);
+  BLERead | BLENotify, 128);
 
 // Actuator position: broadcasts current radius in mm as a float string.
-// Updated every time a gyro/accel packet goes out (~10Hz), so Python
+// Updated every time a gyro/accel packet goes out (~50Hz), so Python
 // always has a matched (ω, r) pair for computing v = ω × r.
 BLEStringCharacteristic positionChar(
   "19b10003-e8f2-537e-4f6c-d104768a1214",
   BLERead | BLENotify, 32);
 
-unsigned long lastGyroSendMs = 0;
-const unsigned long GYRO_SEND_INTERVAL_MS = 100;  // ~10 Hz over BLE
+// micros() (hardware cycle counter), not millis(), so the dt sent to
+// Python alongside each sample reflects actual elapsed time rather than
+// millisecond-tick resolution.
+unsigned long lastSampleMicros = 0;
+// Capped by the BMI270's actual gyro ODR (printed at boot as "gyro sample
+// rate = ... Hz", typically ~104Hz) and by BLE notification throughput —
+// pushing this much below ~10ms risks the central's connection interval
+// not keeping up, causing writeValue() to overwrite not-yet-sent notifies.
+const unsigned long GYRO_SEND_INTERVAL_MS = 50;  // ~50 Hz over BLE
 
 // ── Pin definitions ─────────────────────────────────────────
 const uint8_t PIN_STEP   = 9;   // STEP pulse output (spin motor)
@@ -335,7 +343,7 @@ void setup() {
     stepperService.addCharacteristic(positionChar);
     BLE.addService(stepperService);
     motorCommandChar.writeValue("");
-    gyroDataChar.writeValue("0.00,0.00,0.00,0.000,0.000,0.000");
+    gyroDataChar.writeValue("0.00,0.00,0.00,0.000,0.000,0.000,0.000");
     positionChar.writeValue("0.00");
     // Register event handler — fires immediately when central writes
     // a command, more reliable than polling written() in loop()
@@ -348,8 +356,8 @@ void setup() {
 
   // One-time header line for Arduino Serial Plotter — must be
   // printed ONCE before any data lines, exactly this format.
-  // Serial Plotter reads this to label each of the 6 graph traces.
-  Serial.println("gx,gy,gz,ax,ay,az");
+  // Serial Plotter reads this to label each of the 7 graph traces.
+  Serial.println("gx,gy,gz,ax,ay,az,dt_ms");
 }
 
 // ── Main loop ────────────────────────────────────────────────
@@ -386,7 +394,7 @@ void loop() {
 }
 
 // ── Gyroscope + Accelerometer handler ───────────────────────
-// Outputs a clean CSV line: gx,gy,gz,ax,ay,az
+// Outputs a clean CSV line: gx,gy,gz,ax,ay,az,dt_ms
 // Compatible with Arduino Serial Plotter (Tools → Serial Plotter),
 // Python/Excel (read as CSV), and BLE apps (split on comma).
 // No labels mixed into the line — just numbers and a newline.
@@ -454,9 +462,17 @@ void updateGyro() {
   ay *= ACCEL_SCALE;
   az *= ACCEL_SCALE;
 
-  unsigned long now = millis();
-  if (now - lastGyroSendMs < GYRO_SEND_INTERVAL_MS) return;
-  lastGyroSendMs = now;
+  unsigned long nowMicros = micros();
+  if (nowMicros - lastSampleMicros < (unsigned long)GYRO_SEND_INTERVAL_MS * 1000UL) return;
+
+  // Hardware-timed dt since the last sample, in milliseconds. On the very
+  // first sample there's no prior timestamp to diff against, so fall
+  // back to the nominal interval rather than sending a bogus huge dt
+  // (elapsed-since-boot).
+  float dtMillis = (lastSampleMicros == 0)
+      ? (float)GYRO_SEND_INTERVAL_MS
+      : (nowMicros - lastSampleMicros) / 1000.0f;
+  lastSampleMicros = nowMicros;
 
   // Serial: plain CSV for Serial Plotter
   Serial.print(gx, 2); Serial.print(",");
@@ -464,13 +480,17 @@ void updateGyro() {
   Serial.print(gz, 2); Serial.print(",");
   Serial.print(ax, 3); Serial.print(",");
   Serial.print(ay, 3); Serial.print(",");
-  Serial.println(az, 3);
+  Serial.print(az, 3); Serial.print(",");
+  Serial.println(dtMillis, 3);
 
-  // BLE: same CSV string plus matched radius
+  // BLE: same CSV string plus matched radius. dt_ms is the hardware-timed
+  // interval since the last sample was sent — lets Python integrate using
+  // the real sample spacing instead of estimating it from BLE arrival
+  // timing (which is skewed by radio/OS scheduling jitter).
   if (BLE.connected()) {
-    char buf[96];
-    snprintf(buf, sizeof(buf), "%.2f,%.2f,%.2f,%.3f,%.3f,%.3f",
-             gx, gy, gz, ax, ay, az);
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f",
+             gx, gy, gz, ax, ay, az, dtMillis);
     gyroDataChar.writeValue(buf);
     char posBuf[32];
     snprintf(posBuf, sizeof(posBuf), "%.2f",
@@ -807,8 +827,8 @@ void printHelp() {
   Serial.println("  P     Print actuator position");
   Serial.println("  Z<mm> Recalibrate: tell firmware actuator is at <mm> (e.g. Z50 or Z-10)");
   Serial.println("  Same commands work via BLE \"Motor Command\" characteristic");
-  Serial.println("  IMU streams on BLE \"Gyro Data\" characteristic (~10Hz)");
-  Serial.println("  Format: gx,gy,gz,ax,ay,az (deg/s and g-force)");
+  Serial.println("  IMU streams on BLE \"Gyro Data\" characteristic (~20Hz)");
+  Serial.println("  Format: gx,gy,gz,ax,ay,az,dt_ms (deg/s, g-force, ms)");
   Serial.println("════════════════════════════════════════");
   Serial.println();
 }
