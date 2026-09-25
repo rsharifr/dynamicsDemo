@@ -37,15 +37,35 @@ MOTOR_CMD_UUID = "19b10001-e8f2-537e-4f6c-d104768a1214"
 
 # ── Settings ──────────────────────────────────────────────────
 WINDOW_SECONDS = 10
-SAMPLE_RATE_HZ = 25  # must match GYRO_SEND_INTERVAL_MS on the Arduino
+SAMPLE_RATE_HZ = 20  # must match GYRO_SEND_INTERVAL_MS on the Arduino
 BUFFER_SIZE    = WINDOW_SECONDS * SAMPLE_RATE_HZ
 DT             = 1.0 / SAMPLE_RATE_HZ
+# Per-sample gyro reading noise (rad/s) — a rough guess (like the KF's own
+# noise params below), used only to size how much the theta_ddot finite
+# difference in on_gyro_notify amplifies that noise. Tune alongside them.
+OMEGA_NOISE_STD = 0.02
+# Below this |ω| (rad/s), the transverse-accel equation (a_θ = r·θ̈ + 2·ṙ·θ̇)
+# carries essentially no information about r — θ̇≈0 and θ̈ is dominated by
+# gyro differencing noise, not real angular acceleration — so at rest it
+# was injecting near-pure noise into r, drifting it toward zero. Skip
+# that update below this threshold instead of relying on the noise
+# inflation alone to suppress it.
+OMEGA_GATE_RADS = 0.1
 
 # ── Shared state ──────────────────────────────────────────────
 omega_buf   = np.zeros(BUFFER_SIZE)
+# θ̈, differentiated from omega_buf once per sample in on_gyro_notify
+# (via np.gradient over the real time axis) — the single source of truth
+# for both the KF's transverse-accel update and the plot, instead of the
+# KF maintaining its own separate two-point backward-difference formula.
+omega_dot_buf = np.zeros(BUFFER_SIZE)
 r_buf       = np.zeros(BUFFER_SIZE)
 rdot_buf    = np.zeros(BUFFER_SIZE)
 rddot_buf   = np.zeros(BUFFER_SIZE)
+# Actual per-sample dt (seconds) — hardware-timed value from the Arduino
+# when available, see dt_hw_seconds below. Filled with the nominal DT
+# until real samples arrive, so early gradients aren't divided by ~0.
+dt_buf      = np.full(BUFFER_SIZE, DT)
 v_buf       = np.zeros(BUFFER_SIZE)
 a1_buf      = np.zeros(BUFFER_SIZE)
 a2_buf      = np.zeros(BUFFER_SIZE)
@@ -63,42 +83,59 @@ status_msg = "Scanning for StepperBLE..."
 cmd_queue  = queue.Queue()
 
 # ── Radial Kalman filter ─────────────────────────────────────
-# The position characteristic gives a coarse, quantized r reading; the
-# accelerometer's radial axis gives a noisy but fast-responding r̈ via
-# a_r = r̈ - r·ω². Fusing both (constant-acceleration process model,
-# updated by both measurements every tick) gives smoother, more
-# physically consistent r/ṙ/r̈ than differentiating raw r with
-# np.gradient — especially for ṙ/r̈, where differencing noise blows up.
+# r_meas (from the position characteristic) is NOT a real position
+# sensor — it's the stepper's commanded step count converted to mm,
+# open-loop. Under load it can silently skip steps, so r_meas can carry
+# a large, PERSISTENT bias (not just noise) whenever that happens.
+# State is [r, ṙ, r̈, b], with b the accumulated stepper bias:
+#   r_meas = r + b                              (update_position)
+#   a_r    = r̈ - r·ω²                            (update_radial_accel)
+#   a_θ    = r·θ̈ + 2·ṙ·θ̇                          (update_transverse_accel)
+# r_meas alone can't separate r from b (one equation, two unknowns),
+# but a_r/a_θ depend on the TRUE r/ṙ via real physics, independent of
+# whatever the stepper thinks it did — so while spinning (ω≠0), the
+# filter can use them to pin down r/ṙ and back out b by subtraction.
+# While NOT spinning, a_θ/a_r carry no r information (θ̇=θ̈=0), so b is
+# only correctable during active motion — acceptable here since that's
+# also when r actually matters for v=ω×r.
 class RadialKalmanFilter:
-    # accel_std raised (and pos_std/jerk_std lowered) so the filter leans
-    # on the position sensor for r/ṙ and only lets the accelerometer
-    # nudge r̈, rather than the other way around.
-    def __init__(self, r0, pos_std=0.005, accel_std=.50, jerk_std=1.9):
-        self.x = np.array([r0, 0.0, 0.0])              # [r, rdot, rddot]
-        self.P = np.diag([pos_std**2, 1.0, 4.0])
-        self.pos_var   = pos_std ** 2                   # position sensor noise (m^2)
-        self.accel_var = accel_std ** 2                 # accelerometer noise (m^2/s^4)
-        self.jerk_std  = jerk_std                       # process noise: unmodeled jerk (m/s^3)
+    # NOTE: these noise parameters (and bias_std/bias_walk_std) are
+    # first-pass guesses, not yet tuned against real data.
+    def __init__(self, r0, pos_std=0.005, accel_std=.50, jerk_std=0.5,
+                 bias_std=0.02, bias_walk_std=0.01):
+        self.x = np.array([r0, 0.0, 0.0, 0.0])          # [r, rdot, rddot, b]
+        self.P = np.diag([pos_std**2, 1.0, 4.0, bias_std**2])
+        self.pos_var       = pos_std ** 2               # position sensor noise (m^2)
+        self.accel_var     = accel_std ** 2             # accelerometer noise (m^2/s^4)
+        self.jerk_std      = jerk_std                   # process noise: unmodeled jerk (m/s^3)
+        self.bias_walk_var = bias_walk_std ** 2          # stepper-bias random-walk rate (m^2/s)
+        self.bias_var0     = bias_std ** 2               # re-applied by hard_reset_position()
 
     def _process_noise(self, dt):
-        # Discrete white-noise-jerk model: noise enters as jerk and is
-        # integrated through r̈, ṙ, r (standard constant-acceleration Q).
+        # Discrete white-noise-jerk model for [r, rdot, rddot]: noise
+        # enters as jerk and is integrated through r̈, ṙ, r (standard
+        # constant-acceleration Q). b gets its own independent random-walk
+        # noise — it doesn't couple with the r/ṙ/r̈ dynamics directly,
+        # only through the position measurement.
         q = self.jerk_std ** 2
-        print(dt)
         dt2, dt3, dt4, dt5 = dt**2, dt**3, dt**4, dt**5
-        return q * np.array([
+        Q = np.zeros((4, 4))
+        Q[:3, :3] = q * np.array([
             [dt5 / 20, dt4 / 8,  dt3 / 6],
             [dt4 / 8,  dt3 / 3,  dt2 / 2],
             [dt3 / 6,  dt2 / 2,  dt     ],
         ])
+        Q[3, 3] = self.bias_walk_var * dt
+        return Q
 
     def predict(self, dt):
         if dt <= 0:
             return
         F = np.array([
-            [1.0, dt, 0.5 * dt * dt],
-            [0.0, 1.0, dt],
-            [0.0, 0.0, 1.0],
+            [1.0, dt, 0.5 * dt * dt, 0.0],
+            [0.0, 1.0, dt,           0.0],
+            [0.0, 0.0, 1.0,          0.0],
+            [0.0, 0.0, 0.0,          1.0],
         ])
         self.x = F @ self.x
         self.P = F @ self.P @ F.T + self._process_noise(dt)
@@ -108,10 +145,34 @@ class RadialKalmanFilter:
         S = H @ self.P @ H + var
         K = (self.P @ H) / S
         self.x = self.x + K * y
-        self.P = (np.eye(3) - np.outer(K, H)) @ self.P
+        self.P = (np.eye(4) - np.outer(K, H)) @ self.P
 
     def update_position(self, r_meas):
-        self._update(r_meas, np.array([1.0, 0.0, 0.0]), self.pos_var)
+        # r_meas = r + b — the stepper's report is the true position
+        # plus whatever bias has accumulated from lost steps.
+        self._update(r_meas, np.array([1.0, 0.0, 0.0, 1.0]), self.pos_var)
+
+    def hard_reset_position(self, r_value):
+        # A manual recalibration (Z<mm>) is not a normal measurement —
+        # the user is directly declaring the true position, and the
+        # firmware resets its own step counter to match. Reconciling that
+        # gradually through the ordinary Kalman update (splitting the
+        # jump between r and b according to their current, possibly
+        # tight, covariances) is exactly why Z<mm> looked "resistant":
+        # the filter was slow-walking toward it instead of snapping.
+        # So snap r to the declared value and wipe the bias (a fresh
+        # calibration reference has no accumulated stepper error yet),
+        # restoring both to their initial uncertainty. rdot/rddot are
+        # left alone — a coordinate recalibration doesn't imply the rig
+        # physically stopped.
+        self.x[0] = r_value
+        self.x[3] = 0.0
+        self.P[0, :] = 0.0
+        self.P[:, 0] = 0.0
+        self.P[3, :] = 0.0
+        self.P[:, 3] = 0.0
+        self.P[0, 0] = self.pos_var
+        self.P[3, 3] = self.bias_var0
 
     def update_radial_accel(self, ar_meas, omega):
         # Solve a_r = r̈ - r·ω² for r̈, using the filter's current r
@@ -127,7 +188,30 @@ class RadialKalmanFilter:
         # ignores it.
         z = ar_meas + self.x[0] * omega ** 2
         effective_var = self.accel_var + (omega ** 4) * self.P[0, 0]
-        self._update(z, np.array([0.0, 0.0, 1.0]), effective_var)
+        self._update(z, np.array([0.0, 0.0, 1.0, 0.0]), effective_var)
+
+    def update_transverse_accel(self, at_meas, theta_dot, theta_ddot,
+                                 theta_dot_var=0.0, theta_ddot_var=0.0):
+        # a_θ = r·θ̈ + 2·ṙ·θ̇ — linear in (r, ṙ) given theta_dot/theta_ddot
+        # (both from the gyro, not the stepper). A second, independent
+        # physical equation constraining r/ṙ that has nothing to do with
+        # the stepper's self-reported position — see class docstring.
+        #
+        # theta_ddot is usually a finite difference of consecutive gyro
+        # samples (see on_gyro_notify), which amplifies gyro noise by
+        # ~1/dt — treating it as an exactly-known coefficient in H (as if
+        # it had zero noise) is exactly what made this update "overly
+        # sensitive": any transient wobble in the differenced θ̈ got
+        # attributed entirely to real r/ṙ motion. Propagate the caller's
+        # supplied variances for theta_dot/theta_ddot through the same
+        # linearization used for update_radial_accel's ω² term, so a
+        # noisy θ̈ automatically de-weights this update instead of
+        # yanking r/ṙ around.
+        H = np.array([theta_ddot, 2.0 * theta_dot, 0.0, 0.0])
+        effective_var = (self.accel_var
+                         + (self.x[0] ** 2) * theta_ddot_var
+                         + (2.0 * self.x[1]) ** 2 * theta_dot_var)
+        self._update(at_meas, H, effective_var)
 
     @property
     def r(self):     return self.x[0]
@@ -135,6 +219,8 @@ class RadialKalmanFilter:
     def rdot(self):  return self.x[1]
     @property
     def rddot(self): return self.x[2]
+    @property
+    def bias(self):  return self.x[3]
 
 radial_kf    = None
 kf_last_time = None
@@ -165,26 +251,60 @@ def on_gyro_notify(sender, data: bytearray):
         omega_rads = omega_magnitude * omega_direction
         r_meas     = latest_r
 
-        # Fuse the position reading and radial accelerometer axis (acc1)
-        # into estimates of r, ṙ, r̈ — see RadialKalmanFilter above.
+        # Fuse the position reading and both in-plane accelerometer axes
+        # (acc1=radial, acc3=transverse) into estimates of r, ṙ, r̈ — see
+        # RadialKalmanFilter above. Guarded by buf_lock alongside the
+        # buffer rolls below since hard_reset_position() (triggered by a
+        # Z<mm> command) can mutate radial_kf from the GUI thread while
+        # this callback runs on the BLE thread.
         now = time.monotonic()
-        if radial_kf is None:
-            radial_kf    = RadialKalmanFilter(r_meas)
-            kf_last_time = now
-        else:
-            dt = dt_hw_seconds if dt_hw_seconds is not None else (now - kf_last_time)
-            radial_kf.predict(dt)
-            kf_last_time = now
-            radial_kf.update_position(r_meas)
-            radial_kf.update_radial_accel(acc1, omega_rads)
-
-        r_m     = radial_kf.r
-        rdot_m  = radial_kf.rdot
-        rddot_m = radial_kf.rddot
-        v_ms    = omega_rads * r_m
         with buf_lock:
-            global omega_buf, r_buf, rdot_buf, rddot_buf, v_buf, a1_buf, a2_buf, a3_buf, ar_buf, at_buf, az_buf
-            omega_buf   = np.roll(omega_buf,   -1);  omega_buf[-1]   = omega_rads
+            global omega_buf, omega_dot_buf, r_buf, rdot_buf, rddot_buf, dt_buf, v_buf, a1_buf, a2_buf, a3_buf, ar_buf, at_buf, az_buf
+
+            first_sample = radial_kf is None
+            if first_sample:
+                radial_kf = RadialKalmanFilter(r_meas)
+                dt = DT   # no prior sample yet to diff against — use nominal
+            else:
+                dt = dt_hw_seconds if dt_hw_seconds is not None else (now - kf_last_time)
+            kf_last_time = now
+
+            # Roll ω/dt in before differentiating, so θ̈ is computed from
+            # the buffer that already includes this sample — a single
+            # np.gradient call over the real (non-uniform) time axis,
+            # shared by both this update and compute_plot_data(), instead
+            # of the KF maintaining its own separate two-point backward
+            # difference (numpy's edge formula is also more accurate than
+            # a raw two-point difference).
+            omega_buf     = np.roll(omega_buf, -1); omega_buf[-1] = omega_rads
+            dt_buf        = np.roll(dt_buf,    -1); dt_buf[-1]    = dt
+            time_axis     = np.cumsum(dt_buf)
+            omega_dot_buf = np.gradient(omega_buf, time_axis)
+
+            if not first_sample:
+                radial_kf.predict(dt)
+                radial_kf.update_position(r_meas)
+                radial_kf.update_radial_accel(acc1, omega_rads)
+                # Below OMEGA_GATE_RADS, skip this update entirely — near
+                # ω=0 it carries no real r information anyway (see the
+                # constant's comment), just noise.
+                if abs(omega_rads) > OMEGA_GATE_RADS:
+                    theta_ddot_est = omega_dot_buf[-1]
+                    # Approximate — assumes a simple two-point difference's
+                    # noise amplification even though np.gradient's edge
+                    # formula differs; fine as a rough, order-of-magnitude
+                    # variance estimate (see OMEGA_NOISE_STD's own caveat).
+                    theta_ddot_var = 2.0 * (OMEGA_NOISE_STD ** 2) / (dt ** 2)
+                    radial_kf.update_transverse_accel(
+                        acc3, omega_rads, theta_ddot_est,
+                        theta_dot_var=OMEGA_NOISE_STD ** 2,
+                        theta_ddot_var=theta_ddot_var)
+
+            r_m     = radial_kf.r
+            rdot_m  = radial_kf.rdot
+            rddot_m = radial_kf.rddot
+            v_ms    = omega_rads * r_m
+
             r_buf       = np.roll(r_buf,       -1);  r_buf[-1]       = r_m
             rdot_buf    = np.roll(rdot_buf,    -1);  rdot_buf[-1]    = rdot_m
             rddot_buf   = np.roll(rddot_buf,   -1);  rddot_buf[-1]   = rddot_m
@@ -212,6 +332,10 @@ def compute_plot_data():
     r/theta are the polar coordinates, *dot/*ddot their time derivatives.
     r/rdot/rddot come from RadialKalmanFilter (fusing the position sensor
     with the radial accelerometer axis), not from differentiating raw r.
+    thetaddot is omega_dot_buf, computed once per sample in on_gyro_notify
+    (via np.gradient over the actual per-sample dt_buf, hardware-timed
+    from the Arduino) — the same value the KF's transverse-accel update
+    used, rather than being recomputed independently here.
     ar/at/az are the raw (measured) accelerometer axes in the polar frame;
     centripetal/coriolis/r_thetaddot/*_total are the corresponding kinematic
     terms computed from r, theta and their derivatives, for comparison
@@ -222,12 +346,12 @@ def compute_plot_data():
         rdot  = rdot_buf.copy()
         rddot = rddot_buf.copy()
         omega = omega_buf.copy()
+        thetaddot = omega_dot_buf.copy()
         ar    = ar_buf.copy()
         at    = at_buf.copy()
         az    = az_buf.copy()
 
-    thetadot  = omega
-    thetaddot = np.gradient(omega, DT)
+    thetadot = omega
 
     centripetal      = -r * omega**2
     radial_total     = rddot - r * omega**2
@@ -320,6 +444,26 @@ def ble_thread_fn():
     asyncio.run(ble_main())
 
 
+def _maybe_handle_recalibration(cmd: str):
+    """If cmd is a Z<mm> recalibration, snap the KF's r straight to the
+    declared value instead of letting it slow-walk there via the normal
+    position update — see RadialKalmanFilter.hard_reset_position(). We
+    trust our own outgoing command's value immediately (we're the one
+    sending it), rather than waiting for a round-trip confirmation.
+    """
+    global radial_kf
+    c = cmd.strip().upper()
+    if not c.startswith("Z") or len(c) < 2:
+        return
+    try:
+        target_mm = float(c[1:])
+    except ValueError:
+        return
+    with buf_lock:
+        if radial_kf is not None:
+            radial_kf.hard_reset_position(target_mm / 1000.0)
+    print(f"KF recalibrated: r snapped to {target_mm / 1000.0:.4f} m (Z command)")
+
 def send_ble_command(cmd: str):
     """Put a command in the queue — BLE loop picks it up within 100ms."""
     if not connected:
@@ -327,6 +471,7 @@ def send_ble_command(cmd: str):
         return
     cmd_queue.put(cmd)
     print(f"Queued: {cmd}")
+    _maybe_handle_recalibration(cmd)
 
 # ── Main GUI ──────────────────────────────────────────────────
 def build_gui():

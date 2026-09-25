@@ -60,6 +60,14 @@
 //  speed ramp — it just updates the timer's interval/enabled state
 //  rather than directly toggling the STEP pin itself.
 //
+//  NOTE: a third hardware timer (Timer2) was tried briefly to trigger
+//  IMU/BLE samples at a jitter-free cadence, independent of loop().
+//  Reverted — stopping stepTimer/actuatorTimer (e.g. on 'S' or 'E')
+//  was observed to also silence the gyro timer's callback, which
+//  points at shared/static state inside NRF52_MBED_TimerInterrupt
+//  across timer instances. Gyro sample timing is back to a plain
+//  micros() diff inside updateGyro(), gated by loop()'s own cadence.
+//
 //  SECOND MOTOR: LINEAR ACTUATOR (position-tracked)
 //  ──────────────────────────────────────────────────
 //  Wired to LEFT side of Arduino (opposite side from spin motor)
@@ -136,15 +144,17 @@ BLEStringCharacteristic positionChar(
   "19b10003-e8f2-537e-4f6c-d104768a1214",
   BLERead | BLENotify, 32);
 
-// micros() (hardware cycle counter), not millis(), so the dt sent to
-// Python alongside each sample reflects actual elapsed time rather than
-// millisecond-tick resolution.
-unsigned long lastSampleMicros = 0;
 // Capped by the BMI270's actual gyro ODR (printed at boot as "gyro sample
 // rate = ... Hz", typically ~104Hz) and by BLE notification throughput —
 // pushing this much below ~10ms risks the central's connection interval
 // not keeping up, causing writeValue() to overwrite not-yet-sent notifies.
 const unsigned long GYRO_SEND_INTERVAL_MS = 50;  // ~50 Hz over BLE
+
+// micros() (hardware cycle counter), not millis(), so the dt sent to
+// Python alongside each sample reflects actual elapsed time rather than
+// millisecond-tick resolution. Gated from loop() itself (not a separate
+// hardware timer — see the TIMING ARCHITECTURE note above for why).
+unsigned long lastSampleMicros = 0;
 
 // ── Pin definitions ─────────────────────────────────────────
 const uint8_t PIN_STEP   = 9;   // STEP pulse output (spin motor)
@@ -180,14 +190,14 @@ const float   START_SPEED = 80.0;
 // at full-step (200 steps/rev): (20 teeth * 2mm) / 200 steps = 0.2 mm/step.
 // Calibrated: M215 produces 200mm real travel on this rig.
 // MM_PER_STEP = (200.0 / 215.0) * 0.2 = 0.18605
-// Min radius: 35mm, Max radius: 235mm, Total travel: 200mm
+// Min radius: 60mm, Max radius: 235mm, Total travel: 200mm
 float MM_PER_STEP   = 0.18605;
 
 // Physical position (mm) that corresponds to actPositionSteps == 0.
 // Set to the known physical minimum on first run; recalibrated at
 // runtime by the Z<mm> command (which also resets actPositionSteps
 // to 0), so it stays accurate after a manual position correction.
-float ZERO_POS_MM = 35.0;
+float ZERO_POS_MM = 60.0;
 
 const float   ACT_MAX_SPEED_STEPS = 4000;   // steps/sec upper limit for actuator
 const float   ACT_ACCEL_STEPS_PER_SEC2 = 400.0;   // gentler ramp for small motor
